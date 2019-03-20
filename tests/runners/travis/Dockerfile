@@ -1,7 +1,7 @@
 FROM golang:alpine AS builder
 
 RUN apk update && apk add --no-cache git
-COPY  ./runners/travis /acceptance/src/codex-travis-testrunner/
+COPY ./codex-travis-testrunner /acceptance/src/codex-travis-testrunner
 COPY ./common/ /go/src/common
 WORKDIR /acceptance/src/codex-travis-testrunner
 
