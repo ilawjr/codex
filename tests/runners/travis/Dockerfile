@@ -14,3 +14,4 @@ FROM scratch
 COPY --from=builder /go/bin/codex-travis-testrunner /go/bin/codex-travis-testrunner
 COPY ./features/helloworld /features
 ENTRYPOINT ["/go/bin/codex-travis-testrunner","-feature=/features","-tags=HelloWorld001"]
+
