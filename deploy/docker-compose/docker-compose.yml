@@ -1,0 +1,62 @@
+version: '3.4'
+
+services:
+  gungnir:
+    image: gungnir:${GUNGNIR_VERSION}
+    container_name: gungnir
+    restart: on-failure
+    ports:
+      - 7000:7000
+      - 7001:7001
+      - 7002:7002
+      - 7003:7003
+    volumes:
+      - ./docFiles/gungnir.yaml:/etc/gungnir/gungnir.yaml
+    networks:
+      - back-tier
+    depends_on:
+      - db
+
+  svalinn:
+    image: svalinn:${SVALINN_VERSION}
+    container_name: svalinn
+    restart: on-failure
+    ports:
+      - 7100:7100
+      - 7101:7101
+      - 7102:7102
+      - 7103:7103
+    volumes:
+      - ./docFiles/svalinn.yaml:/etc/svalinn/svalinn.yaml
+    networks:
+      - back-tier
+    depends_on:
+      - db
+
+  db:
+    image: cockroachdb/cockroach:v2.1.4
+    container_name: db
+    command: start --insecure
+    ports:
+      - 26257:26257
+      - 8080:8080
+    networks:
+      - back-tier
+    volumes:
+      - ./cockroach-data/roach1:/cockroach/cockroach-data
+      - ./certs:/cockroach/certs
+
+  db-init:
+   image: cockroachdb/cockroach:v2.1.4
+   container_name: db-init
+   networks:
+    - back-tier
+   volumes:
+     - ./setup_db.sh:/setup_db.sh
+   entrypoint: "/bin/bash"
+   command: /setup_db.sh
+   depends_on:
+    - db
+
+networks:
+  back-tier:

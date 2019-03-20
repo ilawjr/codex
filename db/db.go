@@ -18,239 +18,329 @@
 package db
 
 import (
+	"database/sql"
 	"errors"
-	"github.com/goph/emperror"
-	"gopkg.in/couchbase/gocb.v1"
 	"strconv"
-	"strings"
 	"time"
+
+	"github.com/go-kit/kit/metrics/provider"
+	"github.com/goph/emperror"
 )
 
-type Interface interface {
-	Initialize() error
-	GetHistory(deviceId string) ([]Event, error)
-	GetTombstone(deviceId string) (map[string]Event, error)
-	RemoveHistory(deviceId string, numToRemove int) error
-	InsertEvent(deviceId string, event Event, tombstoneKey string) error
-	RemoveAll() error
-}
-
-const (
-	historyDoc   = "history"
-	counterDoc   = "counter"
-	tombstoneDoc = "tombstone"
+var (
+	errInvaliddeviceID  = errors.New("Invalid device ID")
+	errInvalidEventType = errors.New("Invalid event type")
+	errNoEvents         = errors.New("no records to be inserted")
 )
 
-type DbConnection struct {
-	Server     string
-	Username   string
-	Password   string
-	Bucket     string
-	NumRetries int
-	Timeout    time.Duration
-	bucketConn *gocb.Bucket
+// Config contains the initial configuration information needed to create a db connection.
+type Config struct {
+	Server         string
+	Username       string
+	Database       string
+	SSLRootCert    string
+	SSLKey         string
+	SSLCert        string
+	NumRetries     int
+	WaitTimeMult   time.Duration
+	ConnectTimeout time.Duration
+	OpTimeout      time.Duration
+
+	// MaxIdleConns sets the max idle connections, the min value is 2
+	MaxIdleConns int
+
+	// MaxOpenConns sets the max open connections, to specify unlimited set to 0
+	MaxOpenConns int
+
+	PingInterval time.Duration
 }
 
-// Tombstone hold the map of the last of certain events
-// that are saved so that they are not deleted
-//
-// swagger:model Tombstone
-type Tombstone struct {
-	Events map[string]Event `json:"events"`
+// Connection contains the tools to edit the database.
+type Connection struct {
+	finder      finder
+	mutliInsert multiinserter
+	deleter     deleter
+	closer      closer
+	pinger      pinger
+	stats       stats
+	gennericDB  *sql.DB
+
+	measures    Measures
+	stopThreads []chan struct{}
 }
 
-// Event represents the event information in the database
+// Event represents the event information in the database.  It has no TTL.
 //
 // swagger:model Event
 type Event struct {
-	// the id for the event
+	// The id for the event.
 	//
 	// required: true
-	Id string `json:"id"`
+	// example: 425808997514969090
+	ID int `json:"id"`
 
-	// the time this event was found
+	// The time this event was found.
 	//
 	// required: true
+	// example: 1549969802
 	Time int64 `json:"time"`
 
-	// the source of this event
+	// The source of this event.
 	//
 	// required: true
+	// example: dns:talaria-1234
 	Source string `json:"src"`
 
-	// the destination of this event
+	// The destination of this event.
 	//
 	// required: true
+	// example: device-status/5/offline
 	Destination string `json:"dest"`
 
-	// the partners related to this device
+	// The partners related to this device.
 	//
 	// required: true
+	// example: ["hello","world"]
 	PartnerIDs []string `json:"partner_ids"`
 
-	// the transaction id for this event
+	// The transaction id for this event.
 	//
 	// required: true
+	// example: AgICJpZCI6ICJtYWM6NDhmN2MwZDc5MDI0Iiw
 	TransactionUUID string `json:"transaction_uuid,omitempty"`
 
-	// payload
+	// list of bytes received from the source.
+	// If the device destination matches "device-status/.*", this is a base64
+	// encoded json map that contains the key "ts", denoting the time the event
+	// was created.
 	//
 	// required: false
+	// example: eyJpZCI6IjUiLCJ0cyI6IjIwMTktMDItMTJUMTE6MTA6MDIuNjE0MTkxNzM1WiIsImJ5dGVzLXNlbnQiOjAsIm1lc3NhZ2VzLXNlbnQiOjEsImJ5dGVzLXJlY2VpdmVkIjowLCJtZXNzYWdlcy1yZWNlaXZlZCI6MH0=
 	Payload []byte `json:"payload,omitempty"`
 
-	// other metadata and details related to this state
+	// Other metadata and details related to this state.
 	//
 	// required: true
+	// example: {"/boot-time":1542834188,"/last-reconnect-reason":"spanish inquisition"}
 	Details map[string]interface{} `json:"details"`
 }
 
-func (db *DbConnection) Initialize() error {
-	var err error
+type Record struct {
+	ID        int    `json:"id" gorm:"AUTO_INCREMENT"`
+	Type      int    `json:"type"`
+	DeviceID  string `json:"deviceid" gorm:"not null;index"`
+	BirthDate int64  `json:"birthdate" gorm:"not null;index"`
+	DeathDate int64  `json:"deathdate" gorm:"not null;index"`
+	Data      []byte `json:"data" gorm:"not null"`
+}
 
-	cluster, err := gocb.Connect("couchbase://" + db.Server)
-	if err != nil {
-		return emperror.WrapWith(err, "Connecting to couchbase failed", "server", db.Server)
-	}
-	// for verbose gocb logging when debugging
-	//gocb.SetLogger(gocb.VerboseStdioLogger())
-	err = cluster.Authenticate(gocb.PasswordAuthenticator{
-		Username: db.Username,
-		Password: db.Password,
-	})
-	if err != nil {
-		return emperror.WrapWith(err, "Couchbase authentication failed", "server", db.Server,
-			"username", db.Username)
+// set Record's table name to be `events`
+func (Record) TableName() string {
+	return "events"
+}
+
+// CreateDbConnection creates db connection and returns the struct to the consumer.
+func CreateDbConnection(config Config, provider provider.Provider) (*Connection, error) {
+	var (
+		conn          *dbDecorator
+		err           error
+		connectionURL string
+	)
+
+	db := Connection{}
+
+	// pq expects seconds
+	connectTimeout := strconv.Itoa(int(config.ConnectTimeout.Seconds()))
+
+	// pq expects milliseconds
+	opTimeout := strconv.Itoa(int(float64(config.OpTimeout.Nanoseconds()) / 1000000))
+
+	// include timeout when connecting
+	// if missing a cert, connect insecurely
+	if config.SSLCert == "" || config.SSLKey == "" || config.SSLRootCert == "" {
+		connectionURL = "postgresql://" + config.Username + "@" + config.Server + "/" +
+			config.Database + "?sslmode=disable&connect_timeout=" + connectTimeout +
+			"&statement_timeout=" + opTimeout
+	} else {
+		connectionURL = "postgresql://" + config.Username + "@" + config.Server + "/" +
+			config.Database + "?sslmode=verify-full&sslrootcert=" + config.SSLRootCert +
+			"&sslkey=" + config.SSLKey + "&sslcert=" + config.SSLCert + "&connect_timeout=" +
+			connectTimeout + "&statement_timeout=" + opTimeout
 	}
 
-	db.bucketConn, err = cluster.OpenBucket(db.Bucket, "")
+	conn, err = connect(connectionURL)
+
 	// retry if it fails
 	waitTime := 1 * time.Second
-	for attempt := 0; attempt < db.NumRetries && err != nil; attempt++ {
+	for attempt := 0; attempt < config.NumRetries && err != nil; attempt++ {
 		time.Sleep(waitTime)
-		db.bucketConn, err = cluster.OpenBucket(db.Bucket, "")
-		waitTime = waitTime * 5
-	}
-	if err != nil {
-		return emperror.WrapWith(err, "Opening bucket failed", "server", db.Server, "username", db.Username,
-			"number of retries", db.NumRetries)
+		conn, err = connect(connectionURL)
+		waitTime = waitTime * config.WaitTimeMult
 	}
 
-	err = db.bucketConn.Manager("", "").CreatePrimaryIndex("", true, false)
 	if err != nil {
-		return emperror.Wrap(err, "Creating Primary Index failed")
+		return &Connection{}, emperror.WrapWith(err, "Connecting to database failed", "connection url", connectionURL)
 	}
 
-	return nil
+	conn.AutoMigrate(&Record{})
+
+	db.finder = conn
+	db.mutliInsert = conn
+	db.deleter = conn
+	db.closer = conn
+	db.pinger = conn
+	db.stats = conn
+	db.gennericDB = conn.DB.DB()
+	db.measures = NewMeasures(provider)
+
+	db.setupMetrics()
+	db.configure(config.MaxIdleConns, config.MaxOpenConns)
+
+	return &db, nil
 }
 
-func (db *DbConnection) GetHistory(deviceId string) ([]Event, error) {
-	var (
-		deviceInfo []Event
-	)
-	if deviceId == "" {
-		return []Event{}, emperror.WrapWith(errors.New("Invalid device id"), "Get history not attempted",
-			"device id", deviceId)
+func (db *Connection) configure(maxIdleConns int, maxOpenConns int) {
+	if maxIdleConns < 2 {
+		maxIdleConns = 2
 	}
-	key := strings.Join([]string{historyDoc, deviceId}, ":")
-	_, err := db.bucketConn.Get(key, &deviceInfo)
-	if err != nil {
-		return []Event{}, emperror.WrapWith(err, "Getting history from database failed", "device id", deviceId)
-	}
-	return deviceInfo, nil
+	db.gennericDB.SetMaxIdleConns(maxIdleConns)
+	db.gennericDB.SetMaxOpenConns(maxOpenConns)
 }
 
-func (db *DbConnection) GetTombstone(deviceId string) (map[string]Event, error) {
-	var (
-		deviceInfo map[string]Event
-	)
-	if deviceId == "" {
-		return map[string]Event{}, emperror.WrapWith(errors.New("Invalid device id"), "Get tombstone not attempted",
-			"device id", deviceId)
-	}
-	key := strings.Join([]string{tombstoneDoc, deviceId}, ":")
-	_, err := db.bucketConn.Get(key, &deviceInfo)
-	if err != nil {
-		return map[string]Event{}, emperror.WrapWith(err, "Getting tombstone from database failed", "device id", deviceId)
-	}
-	return deviceInfo, nil
-}
-
-func (db *DbConnection) RemoveHistory(deviceId string, numToRemove int) error {
-	key := strings.Join([]string{historyDoc, deviceId}, ":")
-	for a := 0; a < numToRemove; a++ {
-		_, err := db.bucketConn.ListRemove(key, 0)
-		return emperror.WrapWith(err, "Removing from history failed", "number of events successfully removed", a,
-			"device id", deviceId)
-	}
-	return nil
-}
-
-func (db *DbConnection) InsertEvent(deviceId string, event Event, tombstoneMapKey string) error {
-	if valid, err := isStateValid(deviceId, event); !valid {
-		return emperror.WrapWith(err, "Insert event not attempted", "device id", deviceId,
-			"event", event)
-	}
-
-	// get event id given device id
-	counterKey := strings.Join([]string{counterDoc, deviceId}, ":")
-	eventId, _, err := db.bucketConn.Counter(counterKey, 1, 0, 0)
-	if err != nil {
-		return emperror.WrapWith(err, "Failed to get event id", "device id", deviceId)
-	}
-
-	event.Id = strconv.FormatUint(eventId, 10)
-
-	// append to the history, create if it doesn't exist (like that java thing?)
-	historyKey := strings.Join([]string{historyDoc, deviceId}, ":")
-	_, err = db.bucketConn.ListAppend(historyKey, &event, true)
-	if err != nil {
-		return emperror.WrapWith(err, "Failed to add event to history", "device id", deviceId,
-			"event id", eventId, "event", event)
-	}
-	// update expiry time of the list document
-	newTimeout := time.Now().Add(db.Timeout).Unix()
-	_, err = db.bucketConn.Touch(historyKey, 0, uint32(newTimeout))
-	if err != nil {
-		return emperror.WrapWith(err, "Failed to update timeout", "device id", deviceId,
-			"event id", eventId, "event", event)
-	}
-
-	//if tombstonekey isn't empty string, then set the tombstone map at that key
-	if tombstoneMapKey != "" {
-		tombstoneKey := strings.Join([]string{tombstoneDoc, deviceId}, ":")
-		events := make(map[string]Event)
-		events[tombstoneKey] = event
-		_, err := db.bucketConn.Insert(tombstoneKey, &events, 0)
-		if err != nil && err != gocb.ErrKeyExists {
-			return emperror.WrapWith(err, "Failed to create tombstone", "device id", deviceId,
-				"event id", eventId, "event", event)
-		}
-		_, err = db.bucketConn.MutateIn(tombstoneKey, 0, 0).
-			Upsert(tombstoneMapKey, &event, false).
-			Execute()
+func (db *Connection) setupMetrics() {
+	// ping to check status
+	pingStop := doEvery(time.Second, func() {
+		err := db.Ping()
 		if err != nil {
-			return emperror.WrapWith(err, "Failed to add event to tombstone", "device id", deviceId,
-				"event id", eventId, "event", event)
+			db.measures.ConnectionStatus.Set(0.0)
+		} else {
+			db.measures.ConnectionStatus.Set(1.0)
 		}
-	}
+	})
+	db.stopThreads = append(db.stopThreads, pingStop)
 
+	// baseline
+	startStats := db.stats.getStats()
+	prevWaitCount := startStats.WaitCount
+	prevWaitDuration := startStats.WaitDuration.Nanoseconds()
+	prevMaxIdleClosed := startStats.MaxIdleClosed
+	prevMaxLifetimeClosed := startStats.MaxLifetimeClosed
+
+	// update measurements
+	metricsStop := doEvery(time.Second, func() {
+		stats := db.stats.getStats()
+
+		// current connections
+		db.measures.PoolOpenConnections.Set(float64(stats.OpenConnections))
+		db.measures.PoolInUseConnections.Set(float64(stats.InUse))
+		db.measures.PoolIdleConnections.Set(float64(stats.Idle))
+
+		// Counters
+		db.measures.SQLWaitCount.Add(float64(stats.WaitCount - prevWaitCount))
+		db.measures.SQLWaitDuration.Add(float64(stats.WaitDuration.Nanoseconds() - prevWaitDuration))
+		db.measures.SQLMaxIdleClosed.Add(float64(stats.MaxIdleClosed - prevMaxIdleClosed))
+		db.measures.SQLMaxLifetimeClosed.Add(float64(stats.MaxLifetimeClosed - prevMaxLifetimeClosed))
+	})
+	db.stopThreads = append(db.stopThreads, metricsStop)
+}
+
+// GetRecords returns a list of records for a given device
+func (db *Connection) GetRecords(deviceID string) ([]Record, error) {
+	var (
+		deviceInfo []Record
+	)
+	err := db.finder.find(&deviceInfo, "device_id = ?", deviceID)
+	if err != nil {
+		db.measures.SQLQueryFailureCount.With(typeLabel, readType).Add(1.0)
+		return []Record{}, emperror.WrapWith(err, "Getting records from database failed", "device id", deviceID)
+	}
+	db.measures.SQLQuerySuccessCount.With(typeLabel, readType).Add(1.0)
+	return deviceInfo, nil
+}
+
+// GetRecords returns a list of records for a given device
+func (db *Connection) GetRecordsOfType(deviceID string, eventType int) ([]Record, error) {
+	var (
+		deviceInfo []Record
+	)
+	err := db.finder.find(&deviceInfo, "device_id = ? AND type = ?", deviceID, eventType)
+	if err != nil {
+		db.measures.SQLQueryFailureCount.With(typeLabel, readType).Add(1.0)
+		return []Record{}, emperror.WrapWith(err, "Getting records from database failed", "device id", deviceID)
+	}
+	db.measures.SQLQuerySuccessCount.With(typeLabel, readType).Add(1.0)
+	return deviceInfo, nil
+}
+
+// PruneRecords removes records past their deathdate.
+func (db *Connection) PruneRecords(t int64) error {
+	rowsAffected, err := db.deleter.delete(&Record{}, "death_date < ?", t)
+	db.measures.SQLDeletedRows.Add(float64(rowsAffected))
+	if err != nil {
+		db.measures.SQLQueryFailureCount.With(typeLabel, deleteType).Add(1.0)
+		return emperror.WrapWith(err, "Prune records failed", "time", t)
+	}
+	db.measures.SQLQuerySuccessCount.With(typeLabel, deleteType).Add(1.0)
 	return nil
 }
 
-func isStateValid(deviceId string, event Event) (bool, error) {
-	if deviceId == "" {
-		return false, errors.New("Invalid device id")
+// InsertEvent adds a record to the table.
+func (db *Connection) InsertRecords(records ...Record) error {
+	err := db.mutliInsert.insert(records)
+	if err != nil {
+		db.measures.SQLQueryFailureCount.With(typeLabel, insertType).Add(1.0)
+		return emperror.WrapWith(err, "Inserting records failed", "records", records)
 	}
-	if event.Source == "" {
-		return false, errors.New("Invalid event")
-	}
-	return true, nil
+	db.measures.SQLQuerySuccessCount.With(typeLabel, insertType).Add(1.0)
+	return nil
 }
 
-func (db *DbConnection) RemoveAll() error {
-	_, err := db.bucketConn.ExecuteN1qlQuery(gocb.NewN1qlQuery("DELETE FROM devices;"), nil)
+func (db *Connection) Ping() error {
+	err := db.pinger.ping()
 	if err != nil {
-		return emperror.Wrap(err, "Removing all devices from database failed")
+		db.measures.SQLQueryFailureCount.With(typeLabel, pingType).Add(1.0)
+		return emperror.WrapWith(err, "Pinging connection failed")
 	}
+	db.measures.SQLQuerySuccessCount.With(typeLabel, pingType).Add(1.0)
+	return nil
+}
+
+func (db *Connection) Close() error {
+	for _, stopThread := range db.stopThreads {
+		stopThread <- struct{}{}
+	}
+
+	err := db.closer.close()
+	if err != nil {
+		return emperror.WrapWith(err, "Closing connection failed")
+	}
+	return nil
+}
+
+func doEvery(d time.Duration, f func()) chan struct{} {
+	ticker := time.NewTicker(d)
+	stop := make(chan struct{}, 1)
+	go func(stop chan struct{}) {
+		for {
+			select {
+			case <-ticker.C:
+				f()
+			case <-stop:
+				return
+			}
+		}
+	}(stop)
+	return stop
+}
+
+// RemoveAll removes everything in the events table.  Used for testing.
+func (db *Connection) RemoveAll() error {
+	rowsAffected, err := db.deleter.delete(&Record{})
+	db.measures.SQLDeletedRows.Add(float64(rowsAffected))
+	if err != nil {
+		db.measures.SQLQueryFailureCount.With(typeLabel, deleteType).Add(1.0)
+		return emperror.Wrap(err, "Removing all records from database failed")
+	}
+	db.measures.SQLQuerySuccessCount.With(typeLabel, deleteType).Add(1.0)
 	return nil
 }
